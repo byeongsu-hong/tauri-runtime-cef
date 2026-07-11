@@ -9,8 +9,8 @@ use windows::Win32::{
   Foundation::{HWND, POINT, RECT},
   Graphics::Gdi::MapWindowPoints,
   UI::WindowsAndMessaging::{
-    GetParent, GetWindowRect, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetParent,
-    SetWindowPos, ShowWindow,
+    DestroyWindow, GetParent, GetWindowRect, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
+    SetParent, SetWindowPos, ShowWindow,
   },
 };
 
@@ -70,6 +70,10 @@ impl AppWebview {
 
   pub(crate) fn apply_visible(&self, visible: bool) {
     let _ = unsafe { ShowWindow(self.hwnd(), if visible { SW_SHOW } else { SW_HIDE }) };
+  }
+
+  pub(crate) fn destroy_native(&self) {
+    let _ = unsafe { DestroyWindow(self.hwnd()) };
   }
 
   pub(crate) fn apply_physical_bounds(&self, _scale: f64, x: i32, y: i32, width: i32, height: i32) {

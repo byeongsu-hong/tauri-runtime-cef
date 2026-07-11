@@ -591,7 +591,14 @@ impl<T: UserEvent> WinitCefApp<T> {
       // the child browser (and publisher code) alive indefinitely, and its late
       // callback can race parent-window bookkeeping. Window/app teardown already
       // uses force_close=true; standalone child close needs the same semantics.
-      WebviewMessage::Close => child.host.close_browser(1),
+      WebviewMessage::Close => {
+        child.host.close_browser(1);
+        // Windowed CEF browsers are not destroyed by CloseBrowser alone: the
+        // native child hierarchy must also be torn down before OnBeforeClose
+        // runs. Leaving it attached leaks the renderer; letting CEF forward a
+        // close to its top-level parent can close the whole Tauri window.
+        child.destroy_native();
+      }
       WebviewMessage::SetBounds(bounds) => {
         let parent_size = appwindow.window.surface_size();
         let scale = appwindow.window.scale_factor();
