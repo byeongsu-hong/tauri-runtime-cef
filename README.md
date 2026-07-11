@@ -44,6 +44,41 @@ Capabilities this crate adds on top of the imported runtime:
   - **audit sink** (`set_permission_audit`): one event per final decision, carrying the request id, webview label, origin, kinds, per-kind verdicts, and the deny reason — recorded after CEF is answered, so it reflects enforcement rather than intent.
 
   `NormalizedOrigin::is_app_local` is offered as a *transport* fact (custom schemes, localhost/loopback, `*.localhost`), not a trust verdict: an app that proxies remote content through a local origin — a gateway, a preview server — must distinguish those by webview label, since the origin cannot.
+
+  The crate holds no policy of its own — it asks yours, before `tauri::Builder::run`:
+
+  ```rust
+  use tauri_runtime_cef::{DenyReason, PermissionKind, Verdict, DEFAULT_PROMPT_TIMEOUT};
+
+  tauri_runtime_cef::set_permission_policy(|request, responder| {
+      // Opaque, `null` and malformed origins do not normalize.
+      let Some(origin) = request.origin.as_ref() else {
+          return responder.deny(DenyReason::InvalidOrigin);
+      };
+      // Your own UI, on your own origin: grant what you declared, nothing else.
+      if request.webview_label == "main" && origin.is_app_local() {
+          let verdicts = request
+              .kinds
+              .iter()
+              .map(|kind| match kind {
+                  PermissionKind::Microphone | PermissionKind::Camera => Verdict::Allow,
+                  _ => Verdict::Deny,
+              })
+              .collect();
+          return responder.decide(verdicts);
+      }
+      // Embedded web content: ask the user, off the CEF thread. An unanswered
+      // prompt, a dropped handle or a closing webview all deny on their own.
+      let deferred = responder.defer(DEFAULT_PROMPT_TIMEOUT);
+      show_your_native_consent_ui(request, deferred);
+  });
+
+  tauri_runtime_cef::set_permission_audit(|event| {
+      eprintln!("permission {:?}: {:?}", event.granted, event.kinds);
+  });
+  ```
+
+  The policy runs on a CEF thread and must not block: decide immediately, or `defer` and answer from your event loop.
 - **Popup policy** (`set_popup_policy`): per-URL / per-webview-label `window.open` decisions.
 - **Cache-lock fail-fast**: when another live process already holds the CEF cache's `SingletonLock`, runtime init returns an actionable error naming the holder pid and the fix (Chromium otherwise only surfaces the conflict later, as a renderer/GPU startup failure).
 - **Exit codes**: `run_return` reports the code passed to exit requests.

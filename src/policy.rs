@@ -378,10 +378,13 @@ impl PermissionResponder {
       pending.finish(false, denied, Some(DenyReason::ProviderDropped));
       return;
     }
-    if verdicts.iter().all(|verdict| *verdict == Verdict::Allow) {
-      pending.finish(true, verdicts, None);
-    } else {
-      pending.finish(false, verdicts, Some(DenyReason::PartialGrantRefused));
+    match refusal(&verdicts) {
+      None => {
+        pending.finish(true, verdicts, None);
+      }
+      Some(reason) => {
+        pending.finish(false, verdicts, Some(reason));
+      }
     }
   }
 
@@ -405,6 +408,20 @@ impl PermissionResponder {
       }
     });
     DeferredResponder { pending }
+  }
+}
+
+/// Why a set of per-kind verdicts denies the request, or [`None`] when every
+/// kind was allowed and the request is granted whole.
+fn refusal(verdicts: &[Verdict]) -> Option<DenyReason> {
+  if verdicts.iter().all(|verdict| *verdict == Verdict::Allow) {
+    None
+  } else if verdicts.contains(&Verdict::Allow) {
+    // Some allowed, some not: CEF has no way to grant the subset.
+    Some(DenyReason::PartialGrantRefused)
+  } else {
+    // Nothing was allowed — an ordinary denial, not a subset CEF refused.
+    Some(DenyReason::PolicyDenied)
   }
 }
 
@@ -728,6 +745,20 @@ mod tests {
     let (responder, granted) = pending(vec![PermissionKind::Microphone, PermissionKind::Camera]);
     responder.decide(vec![Verdict::Allow, Verdict::Allow]);
     assert_eq!(granted.try_recv(), Ok(true));
+  }
+
+  #[test]
+  fn the_audit_reason_tells_a_plain_no_from_a_refused_subset() {
+    assert_eq!(refusal(&[Verdict::Allow, Verdict::Allow]), None);
+    assert_eq!(
+      refusal(&[Verdict::Deny, Verdict::Deny]),
+      Some(DenyReason::PolicyDenied),
+      "nothing was allowed — an ordinary denial, not a subset CEF refused"
+    );
+    assert_eq!(
+      refusal(&[Verdict::Allow, Verdict::Deny]),
+      Some(DenyReason::PartialGrantRefused)
+    );
   }
 
   #[test]
