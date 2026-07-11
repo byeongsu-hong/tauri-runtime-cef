@@ -41,6 +41,11 @@ pub struct CefConfig {
   /// forms (`tauri://localhost`, `fetch("ipc://localhost/…")`) work under
   /// CEF. Must cover every scheme the app or its plugins register.
   pub custom_schemes: Vec<String>,
+  /// Custom schemes whose origins get a cookie jar
+  /// (`cef::Settings::cookieable_schemes_list`). CEF cookies only http/https
+  /// by default, so `document.cookie` and `Set-Cookie` are inert on custom
+  /// schemes not listed here. The http/https defaults are preserved.
+  pub cookieable_schemes: Vec<String>,
 }
 
 impl Default for CefConfig {
@@ -54,6 +59,7 @@ impl Default for CefConfig {
       cache_path: None,
       deep_link_schemes: Vec::new(),
       custom_schemes: vec!["tauri".into(), "ipc".into(), "asset".into()],
+      cookieable_schemes: Vec::new(),
     }
   }
 }

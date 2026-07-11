@@ -1381,6 +1381,9 @@ impl<T: UserEvent> CefRuntime<T> {
       no_sandbox: !cfg!(feature = "sandbox") as i32,
       cache_path: cache_path.to_string_lossy().to_string().as_str().into(),
       external_message_pump: 1,
+      // Comma-delimited; empty keeps CEF's http/https-only default. The
+      // defaults stay included because exclude_defaults is left 0.
+      cookieable_schemes_list: cef_config.cookieable_schemes.join(",").as_str().into(),
       ..Default::default()
     };
     if cef::initialize(

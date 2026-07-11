@@ -328,6 +328,14 @@ pub(crate) fn request_context_from_webview_attributes<'a>(
 
   let settings = RequestContextSettings {
     cache_path,
+    // Per-context settings do not inherit the global value, so an empty list
+    // here would silently drop custom-scheme cookie support configured
+    // through `CefConfig::cookieable_schemes`.
+    cookieable_schemes_list: crate::config::config()
+      .cookieable_schemes
+      .join(",")
+      .as_str()
+      .into(),
     ..Default::default()
   };
 
