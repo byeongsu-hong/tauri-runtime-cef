@@ -16,13 +16,8 @@
 //! so it is unit-tested directly; `request_handler.rs` owns the glue that
 //! drives it from `read()` and parks/wakes CEF's `ResourceReadCallback`.
 
-// The pull-side glue (`make_stream`, `StreamBody`, `ReadOutcome`,
-// `streaming_handler_for`) is exercised by tests now and consumed by
-// `request_handler.rs` in the next increment; allow until that lands.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Bounded in-flight chunk budget. Backpressure: a producer blocks on the
@@ -127,7 +122,13 @@ impl StreamWriter {
   pub fn finish(self) {}
 
   fn take_wake(&self) {
-    if let Some(wake) = self.wake.lock().expect("wake slot poisoned").take() {
+    // Release the wake-slot lock BEFORE running the waker: the waker
+    // (request_handler.rs's read glue) re-locks the shared StreamBody to pull
+    // the now-available chunk, and the CEF read thread parks under the same
+    // pair of locks in the opposite order. Invoking the waker while still
+    // holding the wake slot would close that lock cycle into a deadlock.
+    let wake = self.wake.lock().expect("wake slot poisoned").take();
+    if let Some(wake) = wake {
       wake();
     }
   }
@@ -233,17 +234,6 @@ pub(crate) fn make_stream(
     wake,
   };
   (responder, head_slot, body)
-}
-
-/// Non-blocking form used by tests / callers that must not stall the CEF
-/// thread; not part of the shipped path but kept for symmetry with the
-/// bounded channel. Currently unused by the runtime.
-pub(crate) fn try_send(tx: &SyncSender<Vec<u8>>, chunk: Vec<u8>) -> Result<(), StreamClosed> {
-  match tx.try_send(chunk) {
-    Ok(()) => Ok(()),
-    Err(TrySendError::Full(_)) => Ok(()),
-    Err(TrySendError::Disconnected(_)) => Err(StreamClosed),
-  }
 }
 
 #[cfg(test)]

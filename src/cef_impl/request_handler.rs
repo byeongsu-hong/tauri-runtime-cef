@@ -28,10 +28,24 @@ use url::Url;
 use crate::{
   cef_impl::client::{DragDropEventTarget, DragDropState, WebDragDropResourceRequestHandler},
   runtime::RuntimeContext,
+  streaming::{self, InitiatorOrigin, ReadOutcome, StreamBody},
   webview::{CefInitScript, INITIAL_LOAD_URL},
 };
 
 type HttpResponse = Arc<RefCell<Option<http::Response<Cursor<Vec<u8>>>>>>;
+
+/// The pull side of a streaming custom-scheme response, installed by
+/// `process_request` when the request's scheme has a streaming handler. `head`
+/// is the shared slot the handler's `StreamResponder` publishes status +
+/// headers into; `body` is drained by `read()`. Wrapped in `Arc<Mutex>` (not
+/// the buffered path's `RefCell`) because the producer thread's wake closure
+/// re-enters `body` to deliver chunks asynchronously.
+type StreamCell = Arc<Mutex<Option<StreamState>>>;
+
+struct StreamState {
+  head: Arc<Mutex<Option<http::Response<()>>>>,
+  body: StreamBody,
+}
 pub(crate) type SchemeRegistry = Arc<
   Mutex<
     std::collections::HashMap<
@@ -198,6 +212,47 @@ wrap_request_handler! {
   }
 }
 
+/// Copy an `http` head onto CEF's `Response`, set `Cache-Control: no-store`,
+/// derive the MIME from `Content-Type`, and mark the body length unknown
+/// (`-1`). Shared by the buffered and streaming `response_headers` paths, which
+/// differ only in the head's body type.
+fn write_response_headers<B>(
+  cef_response: &mut Response,
+  head: &http::Response<B>,
+  response_length: Option<&mut i64>,
+  redirect_url: Option<&mut CefString>,
+) {
+  cef_response.set_status(head.status().as_u16() as i32);
+  let mut content_type = None;
+
+  for (name, value) in head.headers() {
+    let Ok(value) = value.to_str() else {
+      continue;
+    };
+    cef_response.set_header_by_name(Some(&name.as_str().into()), Some(&value.into()), 0);
+    if name == CONTENT_TYPE {
+      content_type.replace(value.to_string());
+    }
+  }
+
+  cef_response.set_header_by_name(Some(&"Cache-Control".into()), Some(&"no-store".into()), 1);
+
+  let mime_type = content_type
+    .as_ref()
+    .and_then(|t| t.split(';').next())
+    .map(str::trim)
+    .unwrap_or("text/plain");
+  cef_response.set_mime_type(Some(&mime_type.into()));
+
+  if let Some(length) = response_length {
+    *length = -1;
+  }
+
+  if let Some(redirect_url) = redirect_url {
+    let _ = std::mem::take(redirect_url);
+  }
+}
+
 wrap_resource_handler! {
   pub struct WebResourceHandler {
     webview_label: String,
@@ -213,6 +268,9 @@ wrap_resource_handler! {
     initiator_origin: Option<String>,
     // we clone response to send it to the handler thread
     response: HttpResponse,
+    // Set only when this request's scheme has a registered streaming handler;
+    // `response` stays empty in that case and the two paths never mix.
+    stream: StreamCell,
   }
 
   impl ResourceHandler {
@@ -227,70 +285,46 @@ wrap_resource_handler! {
       let url = CefString::from(&request.url()).to_string();
       let url = Url::parse(&url).ok();
 
-      if let Some(url) = url {
-        let callback = ThreadSafe(callback.clone());
-        let response_store = ThreadSafe(self.response.clone());
-        let initialization_scripts = self.initialization_scripts.clone();
-        let responder = Box::new(move |response: http::Response<Cow<'static, [u8]>>| {
-          let is_html = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|ct| ct.to_str().ok())
-            .map(|ct| ct.to_lowercase().starts_with("text/html"))
-            .unwrap_or(false);
+      let Some(url) = url else { return 0 };
+      let scheme = url.scheme().to_string();
 
-          let (parts, body) = response.into_parts();
-          let body_bytes = body.into_owned();
-          let body_bytes = if is_html {
-            inject_scripts_into_html_body(&body_bytes, &initialization_scripts)
-              .unwrap_or(body_bytes)
-          } else {
-            body_bytes
-          };
+      // Extraction shared by both paths — reads `request` before it is dropped.
+      let label = self.webview_label.clone();
+      let data = read_request_body(request);
+      let mut headers = get_request_headers(request);
 
-          let mut response = http::Response::from_parts(parts, Cursor::new(body_bytes));
-
-          if let Some(csp) = response.headers_mut().get_mut(CONTENT_SECURITY_POLICY) {
-            let csp_string = csp.to_str().unwrap_or_default().to_string();
-            let new_csp =
-              csp_inject_initialization_scripts_hashes(csp_string, &initialization_scripts);
-            if let Ok(new_csp) = HeaderValue::from_str(&new_csp) {
-              *csp = new_csp;
-            }
-          }
-
-          response_store.into_owned().borrow_mut().replace(response);
-
-          let callback = callback.into_owned();
-          callback.cont();
-        });
-
-        let label = self.webview_label.clone();
-        let handler = self.handler.clone();
-
-        let data = read_request_body(request);
-        let mut headers = get_request_headers(request);
-
-        // The renderer can issue an IPC request before its execution context is
-        // fully wired to the loader; in that window Chromium sends the request
-        // with `Origin: null` even though the document already has a real
-        // origin. Repair it from the initiating main frame's URL, which the
-        // browser process tracks reliably. Only done when the renderer sent no
-        // origin or a literal `null`, so a correct renderer-sent origin always
-        // wins.
-        if let Some(initiator_origin) = &self.initiator_origin {
-          let origin_missing_or_null = headers
-            .get(ORIGIN)
-            .map(|value| value.as_bytes() == b"null")
-            .unwrap_or(true);
-          if origin_missing_or_null && let Ok(value) = HeaderValue::from_str(initiator_origin) {
-            headers.insert(ORIGIN, value);
-          }
+      // The renderer can issue an IPC request before its execution context is
+      // fully wired to the loader; in that window Chromium sends the request
+      // with `Origin: null` even though the document already has a real
+      // origin. Repair it from the initiating main frame's URL, which the
+      // browser process tracks reliably. Only done when the renderer sent no
+      // origin or a literal `null`, so a correct renderer-sent origin always
+      // wins.
+      if let Some(initiator_origin) = &self.initiator_origin {
+        let origin_missing_or_null = headers
+          .get(ORIGIN)
+          .map(|value| value.as_bytes() == b"null")
+          .unwrap_or(true);
+        if origin_missing_or_null && let Ok(value) = HeaderValue::from_str(initiator_origin) {
+          headers.insert(ORIGIN, value);
         }
+      }
 
-        let method_str = CefString::from(&request.method()).to_string();
-        let method = http::Method::from_bytes(method_str.as_bytes()).unwrap_or(http::Method::GET);
+      let method_str = CefString::from(&request.method()).to_string();
+      let method = http::Method::from_bytes(method_str.as_bytes()).unwrap_or(http::Method::GET);
 
+      // Streaming path: the scheme registered a streaming handler. The handler
+      // publishes the head (which fires `callback.cont()`), then writes body
+      // chunks that `read()` drains. Init-script HTML injection is intentionally
+      // skipped — streaming bodies are never buffered or parsed.
+      if let Some(stream_handler) = streaming::streaming_handler_for(&scheme) {
+        let on_head = ThreadSafe(callback.clone());
+        let (responder, head, body) = streaming::make_stream(Box::new(move || {
+          on_head.into_owned().cont();
+        }));
+        *self.stream.lock().expect("stream slot poisoned") = Some(StreamState { head, body });
+
+        let initiator = InitiatorOrigin(self.initiator_origin.clone());
         std::thread::spawn(move || {
           let mut http_request = http::Request::builder()
             .method(method)
@@ -298,25 +332,136 @@ wrap_resource_handler! {
             .body(data)
             .unwrap();
           *http_request.headers_mut() = headers;
-          // handler is Arc<Box<UriSchemeProtocol>>, so we need to dereference to call it
-          (**handler)(&label, http_request, responder);
+          http_request.extensions_mut().insert(initiator);
+          stream_handler(&label, http_request, responder);
         });
-        1
-      } else {
-        0
+        return 1;
       }
+
+      // Buffered path: tauri's uri-scheme protocol handler produces one whole
+      // response, which `read()` streams out of a `Cursor`.
+      let callback = ThreadSafe(callback.clone());
+      let response_store = ThreadSafe(self.response.clone());
+      let initialization_scripts = self.initialization_scripts.clone();
+      let responder = Box::new(move |response: http::Response<Cow<'static, [u8]>>| {
+        let is_html = response
+          .headers()
+          .get(CONTENT_TYPE)
+          .and_then(|ct| ct.to_str().ok())
+          .map(|ct| ct.to_lowercase().starts_with("text/html"))
+          .unwrap_or(false);
+
+        let (parts, body) = response.into_parts();
+        let body_bytes = body.into_owned();
+        let body_bytes = if is_html {
+          inject_scripts_into_html_body(&body_bytes, &initialization_scripts).unwrap_or(body_bytes)
+        } else {
+          body_bytes
+        };
+
+        let mut response = http::Response::from_parts(parts, Cursor::new(body_bytes));
+
+        if let Some(csp) = response.headers_mut().get_mut(CONTENT_SECURITY_POLICY) {
+          let csp_string = csp.to_str().unwrap_or_default().to_string();
+          let new_csp =
+            csp_inject_initialization_scripts_hashes(csp_string, &initialization_scripts);
+          if let Ok(new_csp) = HeaderValue::from_str(&new_csp) {
+            *csp = new_csp;
+          }
+        }
+
+        response_store.into_owned().borrow_mut().replace(response);
+
+        let callback = callback.into_owned();
+        callback.cont();
+      });
+
+      let handler = self.handler.clone();
+      std::thread::spawn(move || {
+        let mut http_request = http::Request::builder()
+          .method(method)
+          .uri(url.as_str())
+          .body(data)
+          .unwrap();
+        *http_request.headers_mut() = headers;
+        // handler is Arc<Box<UriSchemeProtocol>>, so we need to dereference to call it
+        (**handler)(&label, http_request, responder);
+      });
+      1
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn read(
       &self,
       data_out: *mut u8,
       bytes_to_read: ::std::os::raw::c_int,
       bytes_read: Option<&mut ::std::os::raw::c_int>,
-      _callback: Option<&mut ResourceReadCallback>,
+      callback: Option<&mut ResourceReadCallback>,
     ) -> ::std::os::raw::c_int {
       let Ok(bytes_to_read) = usize::try_from(bytes_to_read) else {
         return 0;
       };
+
+      // Streaming path: drive the StreamBody. When a chunk is buffered we copy
+      // it synchronously; when the producer has not written yet we retain
+      // `data_out` + `callback`, park a wake, and return continue-with-0 — CEF's
+      // async read contract. The wake (fired by the next `StreamWriter::write`
+      // or writer drop, on the producer thread) copies the chunk into the
+      // retained buffer and calls `callback.cont(n)`; `cont(0)` signals EOF.
+      {
+        let mut guard = self.stream.lock().expect("stream slot poisoned");
+        if let Some(state) = guard.as_mut() {
+          if bytes_to_read == 0 {
+            if let Some(bytes_read) = bytes_read {
+              *bytes_read = 0;
+            }
+            return 1;
+          }
+          let out = unsafe { std::slice::from_raw_parts_mut(data_out, bytes_to_read) };
+          let stream = self.stream.clone();
+          let callback = callback.map(|callback| ThreadSafe(callback.clone()));
+          let retained = ThreadSafe((data_out, bytes_to_read));
+          let wake = move || {
+            let (ptr, len) = retained.into_owned();
+            let out = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+            let mut guard = stream.lock().expect("stream slot poisoned");
+            let count = match guard.as_mut() {
+              // The wake only fires after a real write or the writer's drop, so
+              // `Pending` cannot occur here; treat it (and `Done`) as EOF.
+              Some(state) => match state.body.read(out, || {}) {
+                ReadOutcome::Copied(count) => count as ::std::os::raw::c_int,
+                ReadOutcome::Pending | ReadOutcome::Done => 0,
+              },
+              None => 0,
+            };
+            if let Some(callback) = callback {
+              callback.into_owned().cont(count);
+            }
+          };
+          return match state.body.read(out, wake) {
+            ReadOutcome::Copied(count) => {
+              if let Some(bytes_read) = bytes_read {
+                *bytes_read = count as ::std::os::raw::c_int;
+              }
+              1
+            }
+            ReadOutcome::Pending => {
+              if let Some(bytes_read) = bytes_read {
+                *bytes_read = 0;
+              }
+              1
+            }
+            ReadOutcome::Done => {
+              if let Some(bytes_read) = bytes_read {
+                *bytes_read = 0;
+              }
+              0
+            }
+          };
+        }
+      }
+
+      // Buffered path: copy out of the response `Cursor`.
       let data_out = unsafe { std::slice::from_raw_parts_mut(data_out, bytes_to_read) };
       let count = self
         .response
@@ -342,42 +487,28 @@ wrap_resource_handler! {
       response_length: Option<&mut i64>,
       redirect_url: Option<&mut CefString>,
     ) {
-      let (Some(response), Some(response_data)) = (response, &*self.response.borrow()) else {
+      let Some(response) = response else {
         return;
       };
 
-      response.set_status(response_data.status().as_u16() as i32);
-      let mut content_type = None;
-
-      // Set response headers and remember the MIME type for CEF.
-      for (name, value) in response_data.headers() {
-        let Ok(value) = value.to_str() else {
-          continue;
-        };
-
-        response.set_header_by_name(Some(&name.as_str().into()), Some(&value.into()), 0);
-
-        if name == CONTENT_TYPE {
-          content_type.replace(value.to_string());
+      // Streaming path: publish the head the `StreamResponder` stored. By the
+      // time CEF calls this, the handler has already fired `callback.cont()`, so
+      // the head slot is populated.
+      {
+        let guard = self.stream.lock().expect("stream slot poisoned");
+        if let Some(state) = guard.as_ref() {
+          if let Some(head) = state.head.lock().expect("stream head poisoned").as_ref() {
+            write_response_headers(response, head, response_length, redirect_url);
+          }
+          return;
         }
       }
 
-      response.set_header_by_name(Some(&"Cache-Control".into()), Some(&"no-store".into()), 1);
-
-      let mime_type = content_type
-        .as_ref()
-        .and_then(|t| t.split(';').next())
-        .map(str::trim)
-        .unwrap_or("text/plain");
-      response.set_mime_type(Some(&mime_type.into()));
-
-      if let Some(length) = response_length {
-        *length = -1;
-      }
-
-      if let Some(redirect_url) = redirect_url {
-        let _ = std::mem::take(redirect_url);
-      }
+      // Buffered path.
+      let Some(response_data) = &*self.response.borrow() else {
+        return;
+      };
+      write_response_headers(response, response_data, response_length, redirect_url);
     }
   }
 }
@@ -424,6 +555,7 @@ wrap_scheme_handler_factory! {
         initialization_scripts,
         initiator_origin,
         Arc::new(RefCell::new(None)),
+        Arc::new(Mutex::new(None)),
       ))
     }
   }
