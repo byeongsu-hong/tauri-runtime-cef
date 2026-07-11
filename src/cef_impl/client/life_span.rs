@@ -103,6 +103,10 @@ wrap_life_span_handler! {
       if browser.is_none() {
         return;
       }
+      // Any permission prompt still open over this webview can no longer be
+      // granted to — deny it rather than leave the callback (and the app's
+      // consent UI) hanging over a dead browser.
+      crate::policy::cancel_pending(&self.webview_label);
       let _ = self
         .sender
         .send(Message::BrowserClosed(self.window_id, self.webview_id));
