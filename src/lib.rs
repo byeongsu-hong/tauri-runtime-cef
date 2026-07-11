@@ -19,8 +19,9 @@ mod window_handle;
 
 pub use config::{configure, CefConfig};
 pub use policy::{
-  is_app_local_origin, set_permission_policy, set_popup_policy, PermissionDecision,
-  PermissionRequest, PermissionRequestKind, PopupRequest,
+  DEFAULT_PROMPT_TIMEOUT, DeferredResponder, DenyReason, NormalizedOrigin, PermissionAudit,
+  PermissionKind, PermissionRequest, PermissionResponder, PopupRequest, RequestSource, Verdict,
+  set_permission_audit, set_permission_policy, set_popup_policy,
 };
 pub use runtime::*;
 pub use webview::*;

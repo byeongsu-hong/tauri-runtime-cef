@@ -36,7 +36,14 @@ Because published tauri only defaults its generic types (`AppHandle`, `WebviewWi
 
 Capabilities this crate adds on top of the imported runtime:
 
-- **Permission policy** (`set_permission_policy`): Chromium permission requests — media access (`getUserMedia`/`getDisplayMedia`) and permission prompts (notifications, geolocation, clipboard, …) — are answered by a deny-biased default: app-local origins (the app's custom schemes, localhost/loopback hosts, `*.localhost`) are allowed, everything else is denied. A per-request hook carrying the webview label, requesting origin, and raw permission mask lets apps layer their own rules (e.g. deny embedded browser views by label).
+- **Permission policy** (`set_permission_policy`): every Chromium permission request — media capture (`getUserMedia`/`getDisplayMedia`) and permission prompts (notifications, geolocation, clipboard, …) — is answered by a deny-by-default policy the app supplies. Highlights:
+  - the policy sees runtime-neutral `PermissionKind`s and a `NormalizedOrigin` (scheme/host lowercased, default port resolved, opaque/`null`/host-less origins refused) instead of raw CEF bitmasks; CEF bits this crate does not know arrive as `PermissionKind::Unknown(bit)` so they can be denied rather than silently dropped;
+  - **no policy set = nothing granted** (`DenyReason::NoPolicy`) — an app cannot forget its way into Chromium's own defaults;
+  - the `PermissionResponder` completes the CEF callback **exactly once** on every path. It can `allow`, `deny`, `decide` per kind, or `defer(timeout)` for a native consent prompt — deferring keeps the CEF callback alive off the CEF thread. Dropping a responder, a prompt timing out (`DEFAULT_PROMPT_TIMEOUT`, 30s), or the webview closing all deny; nothing falls back to a grant;
+  - per-kind verdicts collapse to an all-or-nothing grant because CEF requires it (`getUserMedia`'s granted mask must equal the requested one), so a partial verdict denies the request — the individual verdicts still reach the audit sink;
+  - **audit sink** (`set_permission_audit`): one event per final decision, carrying the request id, webview label, origin, kinds, per-kind verdicts, and the deny reason — recorded after CEF is answered, so it reflects enforcement rather than intent.
+
+  `NormalizedOrigin::is_app_local` is offered as a *transport* fact (custom schemes, localhost/loopback, `*.localhost`), not a trust verdict: an app that proxies remote content through a local origin — a gateway, a preview server — must distinguish those by webview label, since the origin cannot.
 - **Popup policy** (`set_popup_policy`): per-URL / per-webview-label `window.open` decisions.
 - **Cache-lock fail-fast**: when another live process already holds the CEF cache's `SingletonLock`, runtime init returns an actionable error naming the holder pid and the fix (Chromium otherwise only surfaces the conflict later, as a renderer/GPU startup failure).
 - **Exit codes**: `run_return` reports the code passed to exit requests.
