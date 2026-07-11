@@ -32,12 +32,23 @@ fn main() {
 
 Because published tauri only defaults its generic types (`AppHandle`, `WebviewWindow`, …) to wry, apps alias them once (`type AppHandle = tauri::AppHandle<Cef>;`) and build tauri with `default-features = false`.
 
-## How it differs from the feat/cef original
+## Additions
+
+Capabilities this crate adds on top of the imported runtime:
+
+- **Permission policy** (`set_permission_policy`): Chromium permission requests — media access (`getUserMedia`/`getDisplayMedia`) and permission prompts (notifications, geolocation, clipboard, …) — are answered by a deny-biased default: app-local origins (the app's custom schemes, localhost/loopback hosts, `*.localhost`) are allowed, everything else is denied. A per-request hook carrying the webview label, requesting origin, and raw permission mask lets apps layer their own rules (e.g. deny embedded browser views by label).
+- **Popup policy** (`set_popup_policy`): per-URL / per-webview-label `window.open` decisions.
+- **Cache-lock fail-fast**: when another live process already holds the CEF cache's `SingletonLock`, runtime init returns an actionable error naming the holder pid and the fix (Chromium otherwise only surfaces the conflict later, as a renderer/GPU startup failure).
+- **Exit codes**: `run_return` reports the code passed to exit requests.
+
+## Port notes
+
+How building against published tauri changes the mechanics, relative to the feat/cef branch this was extracted from:
 
 - **Custom schemes** (`tauri://localhost`, `fetch("ipc://localhost/…")`, `asset://localhost`) are registered with Chromium as standard/secure/CORS/fetch-enabled schemes (`OnRegisterCustomSchemes`, list from `CefConfig::custom_schemes`), because published tauri emits the native scheme forms on Linux/macOS rather than feat/cef's `http(s)://<scheme>.localhost` mapping. Both forms are served.
-- **Init data** (Chromium switches, cache path, identifier, deep-link schemes) comes from a process-global `CefConfig` instead of feat/cef's generic `RuntimeInitArgs` channel, which published `tauri-runtime` lacks.
-- **`on_new_window` handlers degrade to popup deny**: the published handler type wraps a wry platform webview handle a CEF browser can't construct, so an installed handler denies popups outright (the verdict every known caller returns). No handler keeps CEF's native popup behavior.
-- feat/cef's trait additions that published tauri never calls (`go_back`/`go_forward` and friends) are inherent methods on `CefWebviewDispatcher`; the address-changed and per-webview runtime-style channels are dormant until upstream ships them.
+- **Init data** (Chromium switches, cache path, identifier, deep-link schemes) comes from a process-global `CefConfig`; published `tauri-runtime` has no channel for runtime-specific init arguments.
+- **`on_new_window` handlers act as a popup-deny signal** (unless a `set_popup_policy` hook decides otherwise): the published handler type wraps a wry platform webview handle that has no CEF equivalent, so the handler itself cannot be invoked — installing one denies popups, absence keeps CEF's native popup behavior.
+- feat/cef trait surface that published tauri doesn't call yet (`go_back`/`go_forward` and friends) lives on as inherent methods on `CefWebviewDispatcher`; the address-changed and per-webview runtime-style channels are dormant until a tauri release ships them.
 
 ## Known ceilings
 

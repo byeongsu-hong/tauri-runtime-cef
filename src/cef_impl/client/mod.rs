@@ -107,6 +107,7 @@ wrap_client! {
         self.proxy.clone(),
         self.window_id,
         self.webview_id,
+        self.label.clone(),
         self.context.clone(),
         self.handlers.new_window_handler.clone(),
         self.initial_url.clone(),
@@ -143,7 +144,7 @@ wrap_client! {
     }
 
     fn permission_handler(&self) -> Option<PermissionHandler> {
-      Some(TauriCefPermissionHandler::new())
+      Some(TauriCefPermissionHandler::new(self.label.clone()))
     }
 
     fn on_process_message_received(

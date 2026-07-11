@@ -10,6 +10,7 @@ mod compat;
 mod config;
 mod external_message_pump;
 mod platform;
+mod policy;
 mod runtime;
 mod webview;
 mod window;
@@ -17,6 +18,10 @@ mod window_builder;
 mod window_handle;
 
 pub use config::{configure, CefConfig};
+pub use policy::{
+  is_app_local_origin, set_permission_policy, set_popup_policy, PermissionDecision,
+  PermissionRequest, PermissionRequestKind, PopupRequest,
+};
 pub use runtime::*;
 pub use webview::*;
 pub use window::CefWindowDispatcher;

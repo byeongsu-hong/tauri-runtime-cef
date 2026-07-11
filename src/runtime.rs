@@ -394,6 +394,9 @@ pub(crate) struct WinitCefApp<T: UserEvent> {
   receiver: Receiver<Message<T>>,
   pub(crate) state: AppState<T>,
   pub(crate) scheme_registry: request_handler::SchemeRegistry,
+  /// Exit code from `RequestExit`, read back by `Runtime::run_return` after
+  /// the event loop finishes (winit's `run_app` return carries no code).
+  exit_code: Arc<std::sync::atomic::AtomicI32>,
 }
 
 impl<T: UserEvent> WinitCefApp<T> {
@@ -402,6 +405,7 @@ impl<T: UserEvent> WinitCefApp<T> {
     receiver: Receiver<Message<T>>,
     callback: Box<dyn FnMut(RunEvent<T>)>,
     scheme_registry: request_handler::SchemeRegistry,
+    exit_code: Arc<std::sync::atomic::AtomicI32>,
   ) -> Self {
     Self {
       context,
@@ -414,6 +418,7 @@ impl<T: UserEvent> WinitCefApp<T> {
         exiting: false,
       },
       scheme_registry,
+      exit_code,
     }
   }
 
@@ -519,6 +524,7 @@ impl<T: UserEvent> WinitCefApp<T> {
       Message::Task(task) => task(),
       Message::RequestExit(code) => {
         if self.request_exit(Some(code)) {
+          self.exit_code.store(code, Ordering::Release);
           self.close_all_browsers();
           self.exit_if_done(event_loop);
         }
@@ -993,6 +999,32 @@ wrap_app! {
   }
 }
 
+/// Returns the pid of a verifiably-alive process holding this cache's
+/// Chromium `SingletonLock`, if any. The lock is a symlink to
+/// `<hostname>-<pid>`; a stale lock (dead pid, or another host on a shared
+/// home) is ignored — Chromium recovers those itself.
+fn live_singleton_lock_holder(cache_path: &std::path::Path) -> Option<u32> {
+  let target = std::fs::read_link(cache_path.join("SingletonLock")).ok()?;
+  let target = target.to_string_lossy();
+  let (host, pid) = target.rsplit_once('-')?;
+  let pid: u32 = pid.parse().ok()?;
+  let our_host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+    .map(|h| h.trim().to_string())
+    .unwrap_or_default();
+  if !our_host.is_empty() && host != our_host {
+    return None;
+  }
+  #[cfg(target_os = "linux")]
+  let alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
+  #[cfg(not(target_os = "linux"))]
+  let alive = std::process::Command::new("kill")
+    .args(["-0", &pid.to_string()])
+    .status()
+    .map(|s| s.success())
+    .unwrap_or(false);
+  alive.then_some(pid)
+}
+
 pub fn run_cef_helper_process() {
   let args = cef::args::Args::new();
 
@@ -1251,6 +1283,22 @@ impl<T: UserEvent> CefRuntime<T> {
     });
     let _ = create_dir_all(&cache_path);
 
+    // Chromium guards its profile with a `SingletonLock` symlink whose target
+    // is `<hostname>-<pid>`. A second browser process on the same cache dir
+    // doesn't fail at initialize — Chromium only surfaces the conflict later,
+    // as a renderer/GPU startup failure. Fail fast with an actionable error
+    // instead when the holder is verifiably alive.
+    if let Some(holder_pid) = live_singleton_lock_holder(&cache_path) {
+      return Err(Error::CreateWebview(
+        format!(
+          "CEF cache {} is held by running process {holder_pid} (SingletonLock); \
+           close that instance or configure a distinct cache_path/identifier",
+          cache_path.display()
+        )
+        .into(),
+      ));
+    }
+
     // Force X11 usage on Linux
     #[cfg(any(
       target_os = "linux",
@@ -1507,19 +1555,20 @@ impl<T: UserEvent> Runtime<T> for CefRuntime<T> {
   }
 
   fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) -> i32 {
-    self.run(callback);
-    // TODO: return the exit code from the runtime, if possible. For now, always return 0
-    0
-  }
-
-  fn run<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) {
+    let exit_code = Arc::new(std::sync::atomic::AtomicI32::new(0));
     let app = WinitCefApp::new(
       self.context,
       self.receiver,
       Box::new(callback),
       self.scheme_registry,
+      exit_code.clone(),
     );
     let _ = self.event_loop.run_app(app);
     cef::shutdown();
+    exit_code.load(Ordering::Acquire)
+  }
+
+  fn run<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) {
+    self.run_return(callback);
   }
 }

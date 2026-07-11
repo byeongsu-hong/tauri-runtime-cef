@@ -48,6 +48,7 @@ wrap_life_span_handler! {
     proxy: WinitEventLoopProxy,
     window_id: WindowId,
     webview_id: u32,
+    webview_label: String,
     context: RuntimeContext<T>,
     new_window_handler: Option<Arc<crate::compat::NewWindowHandler>>,
     initial_url: Option<String>,
@@ -67,7 +68,7 @@ wrap_life_span_handler! {
       _browser: Option<&mut Browser>,
       _frame: Option<&mut Frame>,
       _popup_id: std::os::raw::c_int,
-      _target_url: Option<&CefString>,
+      target_url: Option<&CefString>,
       _target_frame_name: Option<&CefString>,
       _target_disposition: WindowOpenDisposition,
       _user_gesture: std::os::raw::c_int,
@@ -78,10 +79,20 @@ wrap_life_span_handler! {
       _extra_info: Option<&mut Option<DictionaryValue>>,
       _no_javascript_access: Option<&mut i32>,
     ) -> std::os::raw::c_int {
+      // Return value: 0 = allow the popup, 1 = cancel it.
+      // A crate-level popup policy (set_popup_policy) decides per URL/label
+      // when installed.
+      let url = target_url.map(|u| u.to_string()).unwrap_or_default();
+      if let Some(allow) = crate::policy::popup_allowed(&crate::policy::PopupRequest {
+        webview_label: &self.webview_label,
+        url: &url,
+      }) {
+        return i32::from(!allow);
+      }
       // ponytail: published tauri's new-window handler cannot be invoked from
       // CEF — its NewWindowFeatures wraps a wry platform webview handle
       // (webkit2gtk::WebView on Linux) that a CEF browser cannot construct.
-      // An installed handler therefore degrades to a blanket popup deny (the
+      // An installed handler therefore degrades to a popup deny (the
       // verdict every current caller returns); no handler keeps CEF's native
       // popup behavior. Revisit when upstream releases feat/cef's
       // runtime-generic opener.
