@@ -12,12 +12,16 @@ mod external_message_pump;
 mod platform;
 mod policy;
 mod runtime;
+mod streaming;
 mod webview;
 mod window;
 mod window_builder;
 mod window_handle;
 
 pub use config::{configure, CefConfig};
+pub use streaming::{
+  register_streaming_scheme_handler, InitiatorOrigin, StreamClosed, StreamResponder, StreamWriter,
+};
 pub use policy::{
   DEFAULT_PROMPT_TIMEOUT, DeferredResponder, DenyReason, NormalizedOrigin, PermissionAudit,
   PermissionKind, PermissionRequest, PermissionResponder, PopupRequest, RequestSource, Verdict,
