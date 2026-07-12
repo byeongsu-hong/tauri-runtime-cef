@@ -225,15 +225,23 @@ fn write_response_headers<B>(
   cef_response.set_status(head.status().as_u16() as i32);
   let mut content_type = None;
 
+  // Apply via a multimap so REPEATED header names survive — `Set-Cookie` is
+  // the common one, and a page that sets two cookies in a single response must
+  // keep both. `set_header_by_name(.., overwrite=0)` per value silently drops
+  // the second (it only sets when the name is absent), so build the whole map
+  // and set it once. `http::HeaderMap`'s iterator yields (name, value) for
+  // every value, so duplicates come through naturally.
+  let mut map = CefStringMultimap::new();
   for (name, value) in head.headers() {
     let Ok(value) = value.to_str() else {
       continue;
     };
-    cef_response.set_header_by_name(Some(&name.as_str().into()), Some(&value.into()), 0);
+    map.append(name.as_str(), value);
     if name == CONTENT_TYPE {
       content_type.replace(value.to_string());
     }
   }
+  cef_response.set_header_map(Some(&mut map));
 
   cef_response.set_header_by_name(Some(&"Cache-Control".into()), Some(&"no-store".into()), 1);
 
