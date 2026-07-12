@@ -296,18 +296,22 @@ wrap_resource_handler! {
       // The renderer can issue an IPC request before its execution context is
       // fully wired to the loader; in that window Chromium sends the request
       // with `Origin: null` even though the document already has a real
-      // origin. Repair it from the initiating main frame's URL, which the
-      // browser process tracks reliably. Only done when the renderer sent no
-      // origin or a literal `null`, so a correct renderer-sent origin always
-      // wins.
-      if let Some(initiator_origin) = &self.initiator_origin {
-        let origin_missing_or_null = headers
+      // origin. Repair that from the initiating main frame's URL, which the
+      // browser process tracks reliably.
+      //
+      // ONLY a literal `null` is repaired — an ABSENT `Origin` is left absent.
+      // Absence is meaningful: a top-level navigation and a same-origin GET
+      // carry no `Origin` by design, and inventing one turns a navigation into
+      // what looks like a cross-origin call from the *previous* page — which a
+      // server's origin check then rightly refuses. A correct renderer-sent
+      // origin always wins.
+      if let Some(initiator_origin) = &self.initiator_origin
+        && headers
           .get(ORIGIN)
-          .map(|value| value.as_bytes() == b"null")
-          .unwrap_or(true);
-        if origin_missing_or_null && let Ok(value) = HeaderValue::from_str(initiator_origin) {
-          headers.insert(ORIGIN, value);
-        }
+          .is_some_and(|value| value.as_bytes() == b"null")
+        && let Ok(value) = HeaderValue::from_str(initiator_origin)
+      {
+        headers.insert(ORIGIN, value);
       }
 
       let method_str = CefString::from(&request.method()).to_string();
@@ -546,8 +550,7 @@ wrap_scheme_handler_factory! {
         .filter(|frame| frame.is_main() == 1)
         .map(|frame| CefString::from(&frame.url()).to_string())
         .and_then(|url| Url::parse(&url).ok())
-        .map(|url| url.origin().ascii_serialization())
-        .filter(|origin| origin != "null");
+        .and_then(|url| tuple_origin(&url));
 
       Some(WebResourceHandler::new(
         webview_label,
@@ -610,6 +613,56 @@ fn read_request_body(request: &mut Request) -> Vec<u8> {
   }
 
   body
+}
+
+/// The tuple origin of `url`, as **Chromium** serializes it.
+///
+/// `Url::origin()` implements the URL spec, where only *special* schemes
+/// (http, https, ws, wss, ftp, file) get a tuple origin and everything else is
+/// opaque — serialized `"null"`. But a custom scheme registered with
+/// `CEF_SCHEME_OPTION_STANDARD` (which is every scheme in
+/// `CefConfig::custom_schemes`, see `register_tauri_schemes`) DOES get a real
+/// `scheme://host[:port]` tuple origin inside Chromium, and that is the origin
+/// the renderer actually enforces (CSP, CORS) — and the one a scheme handler
+/// must compare against. Composing it by hand for the opaque case is what
+/// makes `InitiatorOrigin` usable on custom schemes at all; without this it is
+/// always `None` there, silently disabling both the `Origin: null` repair in
+/// `process_request` and any same-origin check a handler builds on it.
+fn tuple_origin(url: &Url) -> Option<String> {
+  let spec_origin = url.origin().ascii_serialization();
+  if spec_origin != "null" {
+    return Some(spec_origin);
+  }
+  let host = url.host_str()?;
+  Some(match url.port() {
+    Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
+    None => format!("{}://{}", url.scheme(), host),
+  })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::tuple_origin;
+  use url::Url;
+
+  #[test]
+  fn tuple_origin_covers_special_and_custom_schemes() {
+    let special = Url::parse("https://example.com:8443/x?y").unwrap();
+    assert_eq!(
+      tuple_origin(&special).as_deref(),
+      Some("https://example.com:8443")
+    );
+    // A standard-registered custom scheme: the URL spec calls this opaque, but
+    // Chromium gives it a tuple origin, so we must too.
+    let custom = Url::parse("duck://site.alice.duck/index.html").unwrap();
+    assert_eq!(
+      tuple_origin(&custom).as_deref(),
+      Some("duck://site.alice.duck")
+    );
+    // Genuinely origin-less: nothing to compare against, so no origin.
+    let opaque = Url::parse("data:text/html,hi").unwrap();
+    assert_eq!(tuple_origin(&opaque), None);
+  }
 }
 
 fn get_request_headers(request: &mut Request) -> HeaderMap {
