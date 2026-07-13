@@ -572,10 +572,10 @@ wrap_scheme_handler_factory! {
   }
 }
 
-struct ThreadSafe<T>(T);
+pub(crate) struct ThreadSafe<T>(pub(crate) T);
 
 impl<T> ThreadSafe<T> {
-  fn into_owned(self) -> T {
+  pub(crate) fn into_owned(self) -> T {
     self.0
   }
 }
