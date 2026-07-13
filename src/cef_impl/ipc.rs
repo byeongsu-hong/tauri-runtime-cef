@@ -175,11 +175,15 @@ pub(crate) fn on_process_message_received<T: UserEvent>(
     // threads — this callout runs on the CEF UI thread (the runtime main
     // thread), and Message::Task closures execute on that same thread.
     let handler = crate::cef_impl::request_handler::ThreadSafe(handler.clone());
-    let _ = client
+    if let Err(error) = client
       .context
       .send_message(crate::runtime::Message::Task(Box::new(move || {
         (handler.into_owned())(webview, request);
-      })));
+      })))
+    {
+      // Only fails when the loop is gone (shutdown) — the invoke is moot then.
+      log::debug!("dropped webview IPC message: {error}");
+    }
   }
   1
 }
