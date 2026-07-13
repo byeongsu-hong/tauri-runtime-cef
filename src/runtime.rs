@@ -694,6 +694,18 @@ impl<T: UserEvent> WinitCefApp<T> {
   }
 
   pub(crate) fn close_window(&mut self, window_id: WindowId, event_loop: &dyn ActiveEventLoop) {
+    if !self.state.windows.contains_key(&window_id) {
+      return;
+    }
+    // Emit Destroyed while the window is still in state (emit_window_event
+    // needs it): tauri's core prunes its window registry on this event, and
+    // app close hooks rely on it. Without it every closed window lives on as
+    // a zombie label — get_webview_window keeps returning a dead handle. The
+    // winit Destroyed event can't cover this: by the time it fires the id
+    // mapping below is already gone, so it never routes back to this window.
+    if !self.state.exiting {
+      self.emit_window_event(window_id, WindowEvent::Destroyed);
+    }
     let Some(appwindow) = self.state.windows.remove(&window_id) else {
       return;
     };
@@ -866,9 +878,8 @@ impl<T: UserEvent> ApplicationHandler for WinitCefApp<T> {
       WinitWindowEvent::CloseRequested => self.request_window_close(window_id, event_loop),
 
       WinitWindowEvent::Destroyed => {
-        if !self.state.exiting {
-          self.emit_window_event(window_id, WindowEvent::Destroyed);
-        }
+        // close_window emits WindowEvent::Destroyed (exactly once — a window
+        // that already went through close_window no longer routes here).
         self.close_window(window_id, event_loop);
       }
       WinitWindowEvent::SurfaceResized(size) => {
